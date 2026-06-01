@@ -41,7 +41,11 @@ class FSM:
         self.kick_policy = Kick(state_cmd, policy_output)
         self.kungfu2_policy = KungFu2(state_cmd, policy_output)
         self.beyond_mimic_policy = BeyondMimic(state_cmd, policy_output)
-        self.holomotion_policy = HoloMotion(state_cmd, policy_output)
+        try:
+            self.holomotion_policy = HoloMotion(state_cmd, policy_output)
+        except Exception as e:
+            print("Warning: Failed to load HoloMotion policy:", e)
+            self.holomotion_policy = None
         self.our_dance_policy = OurDance(state_cmd, policy_output)
         
         print("initalized all policies!!!")
