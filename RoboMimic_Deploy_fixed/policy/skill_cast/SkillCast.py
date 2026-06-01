@@ -122,7 +122,7 @@ class SkillCast(FSMState):
     def checkChange(self):
         if(self.cur_step >= self.num_step and self.state_cmd.skill_cmd == FSMCommand.SKILL_1):
             self.state_cmd.skill_cmd = FSMCommand.INVALID
-            return FSMStateName.SKILL_Dance
+            return FSMStateName.SKILL_OUR_DANCE
         elif(self.cur_step >= self.num_step and self.state_cmd.skill_cmd == FSMCommand.SKILL_2):
             self.state_cmd.skill_cmd = FSMCommand.INVALID
             return FSMStateName.SKILL_KungFu
