@@ -9,19 +9,46 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class AmpPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
-    discriminator_hidden_dims = [512, 256, 128]
-    discriminator_activation = "elu"
+    # --- Discriminator architecture ---
+    discriminator_hidden_dims = [512, 512, 256, 256, 128]
+    discriminator_activation = "gelu"       # "elu" | "relu" | "gelu" | "leaky_relu"
+    discriminator_spectral_norm = True
+    discriminator_dropout = 0.1
     discriminator_learning_rate = 3.0e-4
-    gradient_penalty_coef = 10.0
+
+    # --- Loss configuration ---
+    loss_type = "lsgan"                     # "bce" | "lsgan"
+    gradient_penalty_type = "r1"            # "r1" | "wgan" | "none"
+    gradient_penalty_coef = 1.0             # R1: 0.5-2.0; WGAN: 5.0-10.0
     discriminator_batch_size = 1024
+
+    # --- Expert data ---
     expert_motion_file = "/root/G1_Project/XingJiang002.npz"
     expert_motion_fps = 50.0
-    amp_state_dim = 59
-    amp_transition_dim = 118
+
+    # --- AMP state ---
+    amp_state_dim = 59                      # basic: 59; enriched: 80 (auto-detected)
+    amp_transition_dim = 118                # basic: 118; enriched: 160
+    amp_use_enriched_state = True
+    amp_foot_body_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
+    amp_hand_body_names = ["left_wrist_yaw_link", "right_wrist_yaw_link"]
+
+    # --- Multi-scale discriminator ---
+    amp_use_multi_scale = True
+    amp_multi_scale_num = 2
+    amp_multi_scale_step = 5                # 5-step (100ms at 50Hz) for coarse scale
+    amp_multi_scale_weights = [0.7, 0.3]    # short-scale, long-scale weights
+
+    # --- Style reward ---
     style_reward_temperature = 2.0
-    reward_ratio = 1.0
     style_reward_scale = 1.0
+    reward_ratio = 1.0
+
+    # --- Policy ---
     policy_loss_detach_discriminator = True
+
+    # --- Regularization ---
+    discriminator_weight_decay = 1e-5
 
 
 @configclass

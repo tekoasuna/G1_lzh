@@ -4,7 +4,6 @@ import numpy as np
 import pandas as pd
 import onnxruntime
 import torch
-import time
 
 from common.path_config import PROJECT_ROOT
 from FSM.FSMState import FSMStateName, FSMState
@@ -12,239 +11,314 @@ from common.ctrlcomp import StateAndCmd, PolicyOutput
 from common.utils import FSMCommand
 from scipy.spatial.transform import Rotation as R, Slerp
 
+
 class MotionLoader:
+    """Loads reference motion from CSV and provides frame-accurate interpolation.
+
+    CSV format: [root_pos_x, root_pos_y, root_pos_z, root_rot_x, root_rot_y, root_rot_z, root_rot_w, dof_0...dof_28]
+    """
+
     def __init__(self, motion_file, fps=60.0):
         self.dt = 1.0 / fps
         df = pd.read_csv(motion_file, header=None)
         data = df.to_numpy(dtype=np.float32)
-        
+
         self.num_frames = data.shape[0]
         self.duration = self.num_frames * self.dt
-        
+
         self.root_positions = data[:, 0:3]
-        # CSV format: x, y, z, qx, qy, qz, qw
-        # scipy.spatial.transform.Rotation expects x,y,z,w by default
-        self.root_quats = data[:, 3:7] 
+        self.root_quats_xyzw = data[:, 3:7]  # scipy expects x,y,z,w
         self.dof_positions = data[:, 7:]
-        
-        # finite difference for velocities
+
+        # finite-difference velocities
         self.dof_velocities = np.zeros_like(self.dof_positions)
         self.dof_velocities[:-1] = (self.dof_positions[1:] - self.dof_positions[:-1]) / self.dt
         self.dof_velocities[-1] = self.dof_velocities[-2]
-        
-        # Setup fast interpolation
+
         times = np.arange(self.num_frames) * self.dt
-        self.slerp = Slerp(times, R.from_quat(self.root_quats))
-        
+        self.slerp = Slerp(times, R.from_quat(self.root_quats_xyzw))
+
     def update(self, t):
+        """Interpolate motion at time t (seconds).  Returns (root_pos, root_quat_wxyz, dof_pos, dof_vel)."""
         t = np.clip(t, 0.0, self.duration - 1e-5)
         idx0 = int(t / self.dt)
         idx1 = min(idx0 + 1, self.num_frames - 1)
         blend = (t - idx0 * self.dt) / self.dt
-        
+
         root_pos = self.root_positions[idx0] * (1 - blend) + self.root_positions[idx1] * blend
         dof_pos = self.dof_positions[idx0] * (1 - blend) + self.dof_positions[idx1] * blend
         dof_vel = self.dof_velocities[idx0] * (1 - blend) + self.dof_velocities[idx1] * blend
-        
-        root_quat = self.slerp([t])[0].as_quat() # x, y, z, w
-        # BeyondMimic functions expect w, x, y, z
-        root_quat_wxyz = np.array([root_quat[3], root_quat[0], root_quat[1], root_quat[2]], dtype=np.float32)
-        
+
+        root_quat_xyzw = self.slerp([t])[0].as_quat()  # x, y, z, w
+        root_quat_wxyz = np.array([root_quat_xyzw[3], root_quat_xyzw[0], root_quat_xyzw[1], root_quat_xyzw[2]], dtype=np.float32)
         return root_pos, root_quat_wxyz, dof_pos, dof_vel
 
+
+# ---------------------------------------------------------------------------
+# Quaternion / matrix helpers
+# ---------------------------------------------------------------------------
+
+def _quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
+    w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
+    ww = (z1 + x1) * (x2 + y2)
+    yy = (w1 - y1) * (w2 + z2)
+    zz = (w1 + y1) * (w2 - z2)
+    xx = ww + yy + zz
+    qq = 0.5 * (xx + (z1 - x1) * (x2 - y2))
+    w = qq - ww + (z1 - y1) * (y2 - z2)
+    x = qq - xx + (x1 + w1) * (x2 + w2)
+    y = qq - yy + (w1 - x1) * (y2 + z2)
+    z = qq - zz + (z1 + y1) * (w2 - x2)
+    return np.array([w, x, y, z], dtype=np.float32)
+
+
+def _matrix_from_quat(q):
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y**2 + z**2), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x**2 + z**2), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x**2 + y**2)],
+    ], dtype=np.float32)
+
+
+def _yaw_quat(quat_wxyz):
+    """Extract yaw-only quaternion [w, x, y, z]."""
+    rot = _matrix_from_quat(quat_wxyz)
+    yaw = np.arctan2(rot[1, 0], rot[0, 0])
+    return _euler_single_axis_to_quat(yaw, 'z')
+
+
+def _euler_single_axis_to_quat(angle, axis):
+    half = angle / 2.0
+    sin_h = np.sin(half)
+    cos_h = np.cos(half)
+    if axis == 'x':
+        return np.array([cos_h, sin_h, 0.0, 0.0], dtype=np.float32)
+    if axis == 'y':
+        return np.array([cos_h, 0.0, sin_h, 0.0], dtype=np.float32)
+    if axis == 'z':
+        return np.array([cos_h, 0.0, 0.0, sin_h], dtype=np.float32)
+    return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+
+def _anchor_orientation_w(root_quat_wxyz, dof_pos_lab):
+    """Compute anchor (torso) orientation in world frame."""
+    r_yaw = _euler_single_axis_to_quat(dof_pos_lab[2], 'z')
+    r_roll = _euler_single_axis_to_quat(dof_pos_lab[5], 'x')
+    r_pitch = _euler_single_axis_to_quat(dof_pos_lab[8], 'y')
+    torso_local_rot = _quat_mul(r_yaw, _quat_mul(r_roll, r_pitch))
+    return _quat_mul(root_quat_wxyz, torso_local_rot)
+
+
+# ---------------------------------------------------------------------------
+# OurDance FSM state
+# ---------------------------------------------------------------------------
+
 class OurDance(FSMState):
-    def __init__(self, state_cmd:StateAndCmd, policy_output:PolicyOutput):
+    """Deploy AMP-trained mimic policy (OurDance / dance_102).
+
+    Constructs the same observation vector as the training PolicyCfg:
+      [motion_command(58), motion_anchor_ori_b(6), base_ang_vel(3),
+       joint_pos_rel(29), joint_vel_rel(29), last_action(29)] = 154 dims.
+
+    Auto-detects input dimension from ONNX model and validates config.
+    """
+
+    # Expected observation components (for reference and validation)
+    OBS_COMPONENTS = {
+        "motion_command": 58,       # 29 ref joint pos + 29 ref joint vel
+        "motion_anchor_ori_b": 6,   # first 2 cols of relative rotation matrix
+        "base_ang_vel": 3,
+        "joint_pos_rel": 29,
+        "joint_vel_rel": 29,
+        "last_action": 29,
+    }
+    EXPECTED_OBS_DIM = sum(OBS_COMPONENTS.values())  # 154
+
+    def __init__(self, state_cmd: StateAndCmd, policy_output: PolicyOutput):
         super().__init__()
         self.state_cmd = state_cmd
         self.policy_output = policy_output
         self.name = FSMStateName.SKILL_OUR_DANCE
         self.name_str = "our_dance"
         self.counter_step = 0
-        
+
         current_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(current_dir, "config", "OurDance.yaml")
         with open(config_path, "r") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
-            self.onnx_path = os.path.join(current_dir, "model", config["onnx_path"])
-            
-            motion_path = os.path.abspath(os.path.join(PROJECT_ROOT, "..", "unitree_rl_lab", "deploy", "robots", "g1_29dof", "config", "policy", "mimic", "dance_102", "params", config["motion_file"]))
-            self.motion = MotionLoader(motion_path, fps=30.0)
-            
-            self.kps_lab = np.array(config["kp_lab"], dtype=np.float32)
-            self.kds_lab = np.array(config["kd_lab"], dtype=np.float32)
-            self.default_angles_lab = np.array(config["default_angles_lab"], dtype=np.float32)
-            self.mj2lab = np.array(config["mj2lab"], dtype=np.int32)
-            self.num_actions = config["num_actions"]
-            self.num_obs = config["num_obs"]
-            self.action_scale_lab = np.array(config["action_scale_lab"], dtype=np.float32)
-            
-            self.ort_session = onnxruntime.InferenceSession(self.onnx_path)
-            self.input_name = self.ort_session.get_inputs()[0].name
 
-            self.action = np.zeros(self.num_actions, dtype=np.float32)
-            
-            print("OurDance Python policy initializing ...")
-    
+        # --- paths ---
+        self.onnx_path = os.path.join(current_dir, "model", config["onnx_path"])
+        if not os.path.isfile(self.onnx_path):
+            raise FileNotFoundError(f"ONNX model not found: {self.onnx_path}")
+
+        motion_file_rel = config.get("motion_file", "xinjiang.csv")
+        motion_path = os.path.abspath(os.path.join(
+            PROJECT_ROOT, "..", "unitree_rl_lab", "deploy", "robots", "g1_29dof",
+            "config", "policy", "mimic", "dance_102", "params", motion_file_rel,
+        ))
+        if not os.path.isfile(motion_path):
+            raise FileNotFoundError(f"Motion CSV not found: {motion_path}")
+        self.motion = MotionLoader(motion_path, fps=30.0)
+
+        # --- robot parameters ---
+        self.kps_lab = np.array(config["kp_lab"], dtype=np.float32)
+        self.kds_lab = np.array(config["kd_lab"], dtype=np.float32)
+        self.default_angles_lab = np.array(config["default_angles_lab"], dtype=np.float32)
+        self.mj2lab = np.array(config["mj2lab"], dtype=np.int32)
+        self.action_scale_lab = np.array(config["action_scale_lab"], dtype=np.float32)
+
+        # --- ONNX model ---
+        self.ort_session = onnxruntime.InferenceSession(
+            self.onnx_path,
+            providers=['CPUExecutionProvider'],
+        )
+        input_info = self.ort_session.get_inputs()[0]
+        self.input_name = input_info.name
+        self.model_obs_dim = input_info.shape[1]  # batch, obs_dim
+
+        output_info = self.ort_session.get_outputs()[0]
+        self.model_act_dim = output_info.shape[1]  # batch, act_dim
+
+        # --- config validation ---
+        config_num_obs = int(config.get("num_obs", self.model_obs_dim))
+        if config_num_obs != self.model_obs_dim:
+            print(f"[WARN] Config num_obs={config_num_obs} but ONNX expects {self.model_obs_dim}. "
+                  f"Using ONNX value {self.model_obs_dim}.")
+        self.num_obs = self.model_obs_dim
+
+        config_num_actions = int(config.get("num_actions", self.model_act_dim))
+        if config_num_actions != self.model_act_dim:
+            print(f"[WARN] Config num_actions={config_num_actions} but ONNX expects {self.model_act_dim}. "
+                  f"Using ONNX value {self.model_act_dim}.")
+        self.num_actions = self.model_act_dim
+
+        # --- dimension sanity check ---
+        if self.num_obs != self.EXPECTED_OBS_DIM:
+            print(f"[WARN] ONNX expects obs_dim={self.num_obs}, "
+                  f"but default mimic policy expects {self.EXPECTED_OBS_DIM}. "
+                  f"Observation construction may need adjustment.")
+
+        self.action = np.zeros(self.num_actions, dtype=np.float32)
+        self.obs_buffer = np.zeros(self.num_obs, dtype=np.float32)
+
+        # warm up ONNX session
+        for _ in range(10):
+            obs_tensor = self.obs_buffer.reshape(1, -1).astype(np.float32)
+            self.ort_session.run(None, {self.input_name: obs_tensor})
+
+        print(f"[OurDance] ONNX model loaded: obs_dim={self.num_obs}, act_dim={self.num_actions}")
+        print(f"[OurDance] Motion: {self.motion.num_frames} frames, {self.motion.duration:.1f}s")
+
+    # ------------------------------------------------------------------
+    # FSM lifecycle
+    # ------------------------------------------------------------------
+
     def enter(self):
         self.motion_time = 0.0
         self.counter_step = 0
         self.action = np.zeros(self.num_actions, dtype=np.float32)
-        
-        # calculate initial world to init transform
+        self.obs_buffer = np.zeros(self.num_obs, dtype=np.float32)
+
+        # compute initial world-to-torso anchor alignment
         ref_root_pos, ref_root_quat_wxyz, ref_dof_pos, ref_dof_vel = self.motion.update(0.0)
-        
-        # Ref Torso Yaw computation
-        # In Lab order, waist joints are 2 (yaw), 5 (roll), 8 (pitch)
-        # But ref_dof_pos is in Mujoco order! So we index it using mj2lab
-        ref_lab = ref_dof_pos[self.mj2lab]
-        r_yaw = self.euler_single_axis_to_quat(ref_lab[2], 'z')
-        r_roll = self.euler_single_axis_to_quat(ref_lab[5], 'x')
-        r_pitch = self.euler_single_axis_to_quat(ref_lab[8], 'y')
-        temp1 = self.quat_mul(r_roll, r_pitch)
-        temp2 = self.quat_mul(r_yaw, temp1)
-        ref_anchor_ori_w = self.quat_mul(ref_root_quat_wxyz, temp2)
-        
-        robot_quat = self.state_cmd.base_quat # wxyz
-        qj = self.state_cmd.q[self.mj2lab] # Lab order
-        qj = qj - self.default_angles_lab
-        r_yaw_rob = self.euler_single_axis_to_quat(qj[2], 'z')
-        r_roll_rob = self.euler_single_axis_to_quat(qj[5], 'x')
-        r_pitch_rob = self.euler_single_axis_to_quat(qj[8], 'y')
-        t1 = self.quat_mul(r_roll_rob, r_pitch_rob)
-        t2 = self.quat_mul(r_yaw_rob, t1)
-        robot_torso_ori_w = self.quat_mul(robot_quat, t2)
-        
-        init_to_anchor = self.matrix_from_quat(self.yaw_quat(ref_anchor_ori_w))
-        world_to_anchor = self.matrix_from_quat(self.yaw_quat(robot_torso_ori_w))
+        ref_lab = ref_dof_pos[self.mj2lab] - self.default_angles_lab
+        ref_anchor_ori_w = _anchor_orientation_w(ref_root_quat_wxyz, ref_lab)
+
+        robot_quat = self.state_cmd.base_quat
+        qj = self.state_cmd.q[self.mj2lab] - self.default_angles_lab
+        robot_anchor_ori_w = _anchor_orientation_w(robot_quat, qj)
+
+        init_to_anchor = _matrix_from_quat(_yaw_quat(ref_anchor_ori_w))
+        world_to_anchor = _matrix_from_quat(_yaw_quat(robot_anchor_ori_w))
         self.init_to_world = world_to_anchor @ init_to_anchor.T
 
     def run(self):
-        self.motion_time = self.counter_step * 0.02
-        if self.motion_time > self.motion.duration:
-            # Reached end of motion, loop back or stay
+        step_dt = 0.02  # 50 Hz control
+        self.motion_time = self.counter_step * step_dt
+
+        # wrap motion time if beyond duration
+        if self.motion_time >= self.motion.duration:
             self.motion_time = self.motion_time % self.motion.duration
-            
+
         ref_root_pos, ref_root_quat_wxyz, ref_dof_pos, ref_dof_vel = self.motion.update(self.motion_time)
-        
+
+        # reference joint state in Lab order
         ref_lab_pos = ref_dof_pos[self.mj2lab]
         ref_lab_vel = ref_dof_vel[self.mj2lab]
-        
-        # Calculate ref anchor ori w
-        r_yaw = self.euler_single_axis_to_quat(ref_lab_pos[2], 'z')
-        r_roll = self.euler_single_axis_to_quat(ref_lab_pos[5], 'x')
-        r_pitch = self.euler_single_axis_to_quat(ref_lab_pos[8], 'y')
-        temp1 = self.quat_mul(r_roll, r_pitch)
-        temp2 = self.quat_mul(r_yaw, temp1)
-        ref_anchor_ori_w = self.quat_mul(ref_root_quat_wxyz, temp2)
 
-        # Calculate robot torso ori w
+        # --- motion_anchor_ori_b ---
+        ref_anchor_ori_w = _anchor_orientation_w(ref_root_quat_wxyz, ref_lab_pos - self.default_angles_lab)
         robot_quat = self.state_cmd.base_quat
-        qj = self.state_cmd.q[self.mj2lab]
-        qj = qj - self.default_angles_lab
-        r_yaw_rob = self.euler_single_axis_to_quat(qj[2], 'z')
-        r_roll_rob = self.euler_single_axis_to_quat(qj[5], 'x')
-        r_pitch_rob = self.euler_single_axis_to_quat(qj[8], 'y')
-        t1 = self.quat_mul(r_roll_rob, r_pitch_rob)
-        t2 = self.quat_mul(r_yaw_rob, t1)
-        robot_torso_ori_w = self.quat_mul(robot_quat, t2)
-        
-        # Calculate anchor relative feature
-        motion_anchor_ori_b = self.matrix_from_quat(robot_torso_ori_w).T @ self.init_to_world @ self.matrix_from_quat(ref_anchor_ori_w)
-        
+        qj = self.state_cmd.q[self.mj2lab] - self.default_angles_lab
+        robot_anchor_ori_w = _anchor_orientation_w(robot_quat, qj)
+
+        motion_anchor_ori_b = (
+            _matrix_from_quat(robot_anchor_ori_w).T
+            @ self.init_to_world
+            @ _matrix_from_quat(ref_anchor_ori_w)
+        )
+
+        # --- robot state ---
         ang_vel = self.state_cmd.ang_vel
         dqj = self.state_cmd.dq[self.mj2lab]
-        
-        # Construct 154-dim observation
-        # motion_command: 58 (29 pos + 29 vel)
-        # motion_anchor_ori_b: 6 (first two columns of rotation matrix)
-        # base_ang_vel: 3
-        # joint_pos_rel: 29
-        # joint_vel_rel: 29
-        # last_action: 29
-        obs_buf = np.concatenate((
-            ref_lab_pos,
-            ref_lab_vel,
-            motion_anchor_ori_b[:,:2].reshape(-1),
-            ang_vel,
-            qj,
-            dqj,
-            self.action
-        ), axis=-1, dtype=np.float32)
-        
-        obs_tensor = torch.from_numpy(obs_buf).unsqueeze(0).cpu().numpy()
-        observation = {self.input_name: obs_tensor}
-        outputs_result = self.ort_session.run(None, observation)
-        
-        self.action = outputs_result[0].squeeze(0)
-        
-        target_dof_pos_mj = np.zeros(29)
+
+        # --- build observation ---
+        # Observation order MUST match training PolicyCfg:
+        #   motion_command, motion_anchor_ori_b, base_ang_vel,
+        #   joint_pos_rel, joint_vel_rel, last_action
+        obs_parts = [
+            ref_lab_pos,                                 # 29: reference joint positions
+            ref_lab_vel,                                 # 29: reference joint velocities
+            motion_anchor_ori_b[:, :2].reshape(-1),      # 6: first 2 cols of rot mat
+            ang_vel,                                     # 3: base angular velocity
+            qj,                                          # 29: current joint pos (rel)
+            dqj,                                         # 29: current joint vel (rel)
+            self.action,                                 # 29: last action
+        ]
+        obs_concat = np.concatenate(obs_parts, axis=-1, dtype=np.float32)
+
+        # --- dimension check ---
+        if obs_concat.shape[0] != self.num_obs:
+            raise RuntimeError(
+                f"Observation dimension mismatch: built {obs_concat.shape[0]} dims, "
+                f"but ONNX model expects {self.num_obs} dims.\n"
+                f"Part dimensions: "
+                + " ".join(f"{p.shape[0]}" for p in obs_parts)
+            )
+
+        # --- ONNX inference ---
+        obs_tensor = obs_concat.reshape(1, -1)
+        outputs_result = self.ort_session.run(None, {self.input_name: obs_tensor})
+        self.action = outputs_result[0].squeeze(0).astype(np.float32)
+
+        # --- action decode ---
         target_dof_pos_lab = self.action * self.action_scale_lab + self.default_angles_lab
+        target_dof_pos_mj = np.zeros(29, dtype=np.float32)
         target_dof_pos_mj[self.mj2lab] = target_dof_pos_lab
-        
+
         self.policy_output.actions = target_dof_pos_mj
         self.policy_output.kps[self.mj2lab] = self.kps_lab
         self.policy_output.kds[self.mj2lab] = self.kds_lab
-        
+
         self.counter_step += 1
 
     def exit(self):
         self.action = np.zeros(self.num_actions, dtype=np.float32)
-        self.motion_time = 0
+        self.obs_buffer = np.zeros(self.num_obs, dtype=np.float32)
+        self.motion_time = 0.0
         self.counter_step = 0
-        print("OurDance exited")
-        
+        print("[OurDance] exited")
+
     def checkChange(self):
-        if(self.state_cmd.skill_cmd == FSMCommand.LOCO):
-            self.state_cmd.skill_cmd = FSMCommand.INVALID
+        cmd = self.state_cmd.skill_cmd
+        self.state_cmd.skill_cmd = FSMCommand.INVALID
+        if cmd == FSMCommand.LOCO:
             return FSMStateName.SKILL_COOLDOWN
-        elif(self.state_cmd.skill_cmd == FSMCommand.PASSIVE):
-            self.state_cmd.skill_cmd = FSMCommand.INVALID
+        if cmd == FSMCommand.PASSIVE:
             return FSMStateName.PASSIVE
-        elif(self.state_cmd.skill_cmd == FSMCommand.POS_RESET):
-            self.state_cmd.skill_cmd = FSMCommand.INVALID
+        if cmd == FSMCommand.POS_RESET:
             return FSMStateName.FIXEDPOSE
-        else:
-            self.state_cmd.skill_cmd = FSMCommand.INVALID
-            return FSMStateName.SKILL_OUR_DANCE
-            
-    # Quaternion and Matrix utilities (adapted from BeyondMimic.py)
-    def quat_mul(self, q1, q2):
-        w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
-        w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
-        ww = (z1 + x1) * (x2 + y2)
-        yy = (w1 - y1) * (w2 + z2)
-        zz = (w1 + y1) * (w2 - z2)
-        xx = ww + yy + zz
-        qq = 0.5 * (xx + (z1 - x1) * (x2 - y2))
-        w = qq - ww + (z1 - y1) * (y2 - z2)
-        x = qq - xx + (x1 + w1) * (x2 + w2)
-        y = qq - yy + (w1 - x1) * (y2 + z2)
-        z = qq - zz + (z1 + y1) * (w2 - x2)
-        return np.array([w, x, y, z])
-        
-    def matrix_from_quat(self, q):
-        w, x, y, z = q
-        return np.array([
-            [1 - 2 * (y**2 + z**2), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x**2 + z**2), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x**2 + y**2)]
-        ])
-        
-    def yaw_quat(self, quat):
-        rot = self.matrix_from_quat(quat)
-        yaw = np.arctan2(rot[1, 0], rot[0, 0])
-        return self.euler_single_axis_to_quat(yaw, 'z', False)
-        
-    def euler_single_axis_to_quat(self, angle, axis, degrees=False):
-        if degrees:
-            angle = np.radians(angle)
-        half_angle = angle / 2.0
-        sin_half = np.sin(half_angle)
-        cos_half = np.cos(half_angle)
-        if axis == 'x':
-            return np.array([cos_half, sin_half, 0.0, 0.0])
-        elif axis == 'y':
-            return np.array([cos_half, 0.0, sin_half, 0.0])
-        elif axis == 'z':
-            return np.array([cos_half, 0.0, 0.0, sin_half])
-        return np.array([1.0, 0.0, 0.0, 0.0])
+        return FSMStateName.SKILL_OUR_DANCE

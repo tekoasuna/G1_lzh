@@ -245,81 +245,221 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Attach AMP discriminator and expert buffer when amp_algorithm is present
     if hasattr(agent_cfg, "amp_algorithm"):
         try:
-            from unitree_rl_lab.tasks.mimic.amp.core import AmpExpertBuffer, AMPDiscriminator, amp_discriminator_loss
+            from unitree_rl_lab.tasks.mimic.amp.core import (
+                AmpExpertBuffer,
+                AMPDiscriminator,
+                MultiScaleAMPDiscriminator,
+                amp_discriminator_loss,
+                amp_discriminator_accuracy,
+                r1_gradient_penalty,
+                wgan_gradient_penalty,
+            )
             import torch
 
-            # build expert buffer
-            expert_file = agent_cfg.amp_algorithm.expert_motion_file
-            expert_fps = getattr(agent_cfg.amp_algorithm, "expert_motion_fps", None)
-            env.unwrapped.amp_expert_buffer = AmpExpertBuffer(expert_file, motion_fps=expert_fps, device=agent_cfg.device)
+            amp_cfg = agent_cfg.amp_algorithm
 
-            # determine state dim from environment robot asset
-            try:
-                robot_asset = env.unwrapped.scene["robot"]
-                num_joints = int(robot_asset.data.joint_pos.shape[1])
-            except Exception:
-                num_joints = int(getattr(agent_cfg.amp_algorithm, "amp_state_dim", 29))
+            # --- build expert buffer ---
+            expert_file = amp_cfg.expert_motion_file
+            expert_fps = getattr(amp_cfg, "expert_motion_fps", None)
+            use_enriched = getattr(amp_cfg, "amp_use_enriched_state", False)
+            foot_names = getattr(amp_cfg, "amp_foot_body_names", None)
+            hand_names = getattr(amp_cfg, "amp_hand_body_names", None)
 
-            state_dim = 1 + num_joints * 2
-            amp_disc = AMPDiscriminator(state_dim, hidden_dims=agent_cfg.amp_algorithm.discriminator_hidden_dims, activation=agent_cfg.amp_algorithm.discriminator_activation)
+            env.unwrapped.amp_expert_buffer = AmpExpertBuffer(
+                expert_file,
+                motion_fps=expert_fps,
+                device=agent_cfg.device,
+                use_enriched_state=use_enriched,
+                foot_body_names=list(foot_names) if foot_names else None,
+                hand_body_names=list(hand_names) if hand_names else None,
+            )
+
+            # --- determine state dim ---
+            if use_enriched and hasattr(env.unwrapped.amp_expert_buffer, "state_dim"):
+                state_dim = env.unwrapped.amp_expert_buffer.state_dim
+            else:
+                try:
+                    robot_asset = env.unwrapped.scene["robot"]
+                    num_joints = int(robot_asset.data.joint_pos.shape[1])
+                except Exception:
+                    num_joints = 29
+                state_dim = 1 + num_joints * 2
+
+            # --- build discriminator ---
+            use_multi_scale = getattr(amp_cfg, "amp_use_multi_scale", False)
+            disc_hidden = list(getattr(amp_cfg, "discriminator_hidden_dims", [512, 256, 128]))
+            disc_activation = getattr(amp_cfg, "discriminator_activation", "gelu")
+            disc_sn = getattr(amp_cfg, "discriminator_spectral_norm", True)
+            disc_dropout = getattr(amp_cfg, "discriminator_dropout", 0.1)
+
+            if use_multi_scale:
+                multi_scale_num = getattr(amp_cfg, "amp_multi_scale_num", 2)
+                amp_disc = MultiScaleAMPDiscriminator(
+                    state_dim=state_dim,
+                    hidden_dims=disc_hidden,
+                    activation=disc_activation,
+                    spectral_norm=disc_sn,
+                    dropout=disc_dropout,
+                    num_scales=multi_scale_num,
+                )
+            else:
+                amp_disc = AMPDiscriminator(
+                    state_dim=state_dim,
+                    hidden_dims=disc_hidden,
+                    activation=disc_activation,
+                    spectral_norm=disc_sn,
+                    dropout=disc_dropout,
+                )
             amp_disc.to(agent_cfg.device)
-            amp_opt = torch.optim.Adam(amp_disc.parameters(), lr=agent_cfg.amp_algorithm.discriminator_learning_rate)
 
-            # attach to env so reward-term can access
+            # --- optimizer with weight decay ---
+            disc_wd = float(getattr(amp_cfg, "discriminator_weight_decay", 0.0))
+            amp_opt = torch.optim.Adam(
+                amp_disc.parameters(),
+                lr=amp_cfg.discriminator_learning_rate,
+                weight_decay=disc_wd,
+            )
+
+            # --- attach to env ---
             env.unwrapped.amp_discriminator = amp_disc
             env.unwrapped.amp_discriminator_opt = amp_opt
-            env.unwrapped.amp_style_scale = getattr(agent_cfg.amp_algorithm, "style_reward_scale", 0.0) * getattr(agent_cfg.amp_algorithm, "reward_ratio", 1.0)
+            env.unwrapped.amp_style_scale = (getattr(amp_cfg, "style_reward_scale", 0.0) *
+                                              getattr(amp_cfg, "reward_ratio", 1.0))
             env.unwrapped.amp_recent_transitions = []
+            env.unwrapped.amp_style_reward_temperature = getattr(amp_cfg, "style_reward_temperature", 2.0)
+            env.unwrapped.amp_use_enriched_state = use_enriched
+            env.unwrapped.amp_use_multi_scale = use_multi_scale
+            env.unwrapped.amp_multi_scale_step = getattr(amp_cfg, "amp_multi_scale_step", 5)
 
-            # monkeypatch runner.alg.update to alternate discriminator updates after PPO update
+            # --- body indexes for enriched state ---
+            if use_enriched:
+                try:
+                    asset = env.unwrapped.scene["robot"]
+                    body_names = list(asset.body_names) if hasattr(asset, "body_names") else []
+                    if foot_names and body_names:
+                        env.unwrapped.amp_foot_body_ids = [body_names.index(n) for n in foot_names if n in body_names]
+                    if hand_names and body_names:
+                        env.unwrapped.amp_hand_body_ids = [body_names.index(n) for n in hand_names if n in body_names]
+                except Exception:
+                    pass
+
+            # --- monkeypatch runner.alg.update ---
             if hasattr(runner, "alg") and hasattr(runner.alg, "update"):
                 orig_update = runner.alg.update
 
                 def wrapped_update(*args, **kwargs):
-                    # call original PPO update (policy and value)
                     result = orig_update(*args, **kwargs)
 
-                    # then perform discriminator update if enough policy transitions
                     try:
-                        # sample expert transitions
-                        batch_size = int(getattr(agent_cfg.amp_algorithm, "discriminator_batch_size", 256))
-                        device = amp_disc.next_device if hasattr(amp_disc, "next_device") else agent_cfg.device
-                        expert_trans = env.unwrapped.amp_expert_buffer.sample_transition(batch_size, step_dt=1.0 / env.unwrapped.amp_expert_buffer.motion_fps)
-                        # sample policy transitions from recent buffer
+                        batch_size = int(getattr(amp_cfg, "discriminator_batch_size", 1024))
+                        expert_buf = env.unwrapped.amp_expert_buffer
+                        step_dt = 1.0 / expert_buf.motion_fps
+                        multi_scale = getattr(env.unwrapped, "amp_use_multi_scale", False)
+
+                        # --- sample policy transitions ---
                         policy_buf = getattr(env.unwrapped, "amp_recent_transitions", [])
-                        if len(policy_buf) * getattr(env.unwrapped, "num_envs", 1) < batch_size:
+                        if len(policy_buf) == 0:
+                            return result
+                        buf_len = len(policy_buf)
+                        num_envs = policy_buf[0].shape[0]
+                        if buf_len * num_envs < batch_size:
                             return result
 
-                        num_envs = policy_buf[0].shape[0]
-                        idx = torch.randint(0, len(policy_buf), (batch_size,))
+                        idx = torch.randint(0, buf_len, (batch_size,))
                         env_idx = torch.randint(0, num_envs, (batch_size,))
-                        
-                        policy_trans = torch.stack([policy_buf[i][e] for i, e in zip(idx, env_idx)], dim=0).to(agent_cfg.device)
+                        policy_trans = torch.stack(
+                            [policy_buf[i][e] for i, e in zip(idx, env_idx)], dim=0
+                        ).to(agent_cfg.device)
 
-                        # move expert transitions to device
-                        expert_trans = expert_trans.to(agent_cfg.device)
+                        if multi_scale:
+                            # sample multi-scale expert transitions
+                            short_step = step_dt
+                            long_step = step_dt * getattr(amp_cfg, "amp_multi_scale_step", 5)
+                            expert_short, expert_long = expert_buf.sample_multi_scale(
+                                batch_size, step_dt_short=short_step, step_dt_long=long_step
+                            )
 
-                        # compute BCE loss
-                        loss = amp_discriminator_loss(amp_disc, expert_trans, policy_trans)
+                            # sample multi-scale policy transitions
+                            multi_buf = getattr(env.unwrapped, "amp_recent_multi_transitions", [])
+                            policy_long = None
+                            if len(multi_buf) > 0:
+                                midx = torch.randint(0, len(multi_buf), (batch_size,))
+                                policy_long = torch.stack(
+                                    [multi_buf[i][e] for i, e in zip(midx, env_idx)], dim=0
+                                ).to(agent_cfg.device)
 
-                        # optional gradient penalty
-                        gp_coef = float(getattr(agent_cfg.amp_algorithm, "gradient_penalty_coef", 0.0))
-                        if gp_coef > 0.0:
-                            # interpolate
-                            eps = torch.rand(batch_size, 1, device=agent_cfg.device)
-                            interp = eps * expert_trans + (1 - eps) * policy_trans
-                            interp.requires_grad_(True)
-                            logits = amp_disc(interp)
-                            grads = torch.autograd.grad(outputs=logits.sum(), inputs=interp, create_graph=True)[0]
-                            grads = grads.view(batch_size, -1)
-                            grad_norm = grads.norm(2, dim=1)
-                            gp = ((grad_norm - 1.0) ** 2).mean()
-                            loss = loss + gp_coef * gp
+                            disc = amp_disc
+                            loss_type = getattr(amp_cfg, "loss_type", "lsgan")
+                            gp_type = getattr(amp_cfg, "gradient_penalty_type", "r1")
+                            gp_coef = float(getattr(amp_cfg, "gradient_penalty_coef", 1.0))
+
+                            # scale 0: short-term
+                            loss_s = amp_discriminator_loss(
+                                disc.discriminators[0], expert_short, policy_trans, loss_type=loss_type
+                            )
+                            # scale 1: long-term (if available)
+                            if disc.num_scales > 1 and policy_long is not None:
+                                loss_l = amp_discriminator_loss(
+                                    disc.discriminators[1], expert_long, policy_long, loss_type=loss_type
+                                )
+                                loss = loss_s + loss_l
+                            else:
+                                loss = loss_s
+
+                            # R1 gradient penalty on short-scale expert only
+                            if gp_type == "r1" and gp_coef > 0.0:
+                                gp = r1_gradient_penalty(disc.discriminators[0], expert_short)
+                                loss = loss + gp_coef * gp
+                            elif gp_type == "wgan" and gp_coef > 0.0:
+                                gp = wgan_gradient_penalty(disc.discriminators[0], expert_short, policy_trans)
+                                loss = loss + gp_coef * gp
+
+                        else:
+                            expert_trans = expert_buf.sample_transition(batch_size, step_dt=step_dt).to(agent_cfg.device)
+
+                            loss_type = getattr(amp_cfg, "loss_type", "lsgan")
+                            gp_type = getattr(amp_cfg, "gradient_penalty_type", "r1")
+                            gp_coef = float(getattr(amp_cfg, "gradient_penalty_coef", 1.0))
+
+                            loss = amp_discriminator_loss(amp_disc, expert_trans, policy_trans, loss_type=loss_type)
+
+                            if gp_type == "r1" and gp_coef > 0.0:
+                                gp = r1_gradient_penalty(amp_disc, expert_trans)
+                                loss = loss + gp_coef * gp
+                            elif gp_type == "wgan" and gp_coef > 0.0:
+                                gp = wgan_gradient_penalty(amp_disc, expert_trans, policy_trans)
+                                loss = loss + gp_coef * gp
 
                         amp_opt.zero_grad()
                         loss.backward()
-                        torch.nn.utils.clip_grad_norm_(amp_disc.parameters(), float(getattr(agent_cfg.amp_algorithm, "max_grad_norm", 1.0)))
+                        max_grad = float(getattr(amp_cfg, "max_grad_norm", 1.0))
+                        torch.nn.utils.clip_grad_norm_(amp_disc.parameters(), max_grad)
                         amp_opt.step()
+
+                        # log discriminator accuracy periodically
+                        if hasattr(runner, "log_dict"):
+                            try:
+                                test_batch = min(256, batch_size)
+                                if multi_scale:
+                                    e_acc, p_acc = amp_discriminator_accuracy(
+                                        disc.discriminators[0],
+                                        expert_short[:test_batch],
+                                        policy_trans[:test_batch],
+                                    )
+                                else:
+                                    e_acc, p_acc = amp_discriminator_accuracy(
+                                        amp_disc,
+                                        expert_trans[:test_batch] if not multi_scale else expert_short[:test_batch],
+                                        policy_trans[:test_batch],
+                                    )
+                                runner.log_dict({
+                                    "amp_disc_loss": loss.item(),
+                                    "amp_expert_acc": e_acc,
+                                    "amp_policy_acc": p_acc,
+                                    "amp_disc_mean": (e_acc + p_acc) / 2.0,
+                                })
+                            except Exception:
+                                pass
                     except Exception as e:
                         import traceback
                         traceback.print_exc()

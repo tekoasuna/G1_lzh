@@ -82,26 +82,36 @@ if __name__ == "__main__":
                 mujoco.mj_step(m, d)
                 sim_counter += 1
                 if sim_counter % control_decimation == 0:
-                    
+
                     qj = d.qpos[7:]
                     dqj = d.qvel[6:]
-                    quat = d.qpos[3:7]
-                    
-                    omega = d.qvel[3:6] 
+                    base_pos = d.qpos[:3]
+                    quat = d.qpos[3:7]  # w,x,y,z
+
+                    base_lin_vel = d.qvel[:3]
+                    omega = d.qvel[3:6]
                     gravity_orientation = get_gravity_orientation(quat)
-                    
+
                     state_cmd.q = qj.copy()
                     state_cmd.dq = dqj.copy()
-                    state_cmd.gravity_ori = gravity_orientation.copy()
+                    state_cmd.base_pos = base_pos.copy()
                     state_cmd.base_quat = quat.copy()
+                    state_cmd.base_lin_vel = base_lin_vel.copy()
+                    state_cmd.gravity_ori = gravity_orientation.copy()
                     state_cmd.ang_vel = omega.copy()
-                    
-                    FSM_controller.run()
+
+                    try:
+                        FSM_controller.run()
+                    except Exception as e:
+                        print(f"[ERROR] FSM run failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # fallback: maintain last action
                     policy_output_action = policy_output.actions.copy()
                     kps = policy_output.kps.copy()
                     kds = policy_output.kds.copy()
             except ValueError as e:
-                print(str(e))
+                print(f"[ERROR] Simulation error: {e}")
             
             viewer.sync()
             time_until_next_step = m.opt.timestep - (time.time() - step_start)
