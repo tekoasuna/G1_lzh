@@ -89,3 +89,107 @@ gradient_penalty_type = "r1"    # "wgan" | "none"
 - **Better motion quality:** Multi-scale discriminator captures temporal coherence; enriched state captures full-body kinematics
 - **Stabler training:** Spectral norm + R1 prevent discriminator collapse; LSGAN avoids saturating gradients
 - **Monitor:** Track `amp_disc_loss`, `amp_expert_acc`, `amp_policy_acc` — aim for both accuracies around 0.7–0.85 (not near 1.0)
+
+## Critical gotcha: discriminator MUST be attached to the base sim env, not a wrapper
+
+**The bug:** `amp_style` reward is permanently 0 despite the discriminator being initialized. The TensorBoard `amp/` metrics never appear.
+
+**Root cause:** In IsaacLab + RSL-RL training, the gym environment gets wrapped:
+
+```
+gym.make() → ManagerBasedRLEnv          ← base_env (reward terms see THIS)
+    ↓
+RslRlVecEnvWrapper → .unwrapped = ManagerBasedRLEnv
+    ↓
+DictObsWrapper     → .unwrapped = RslRlVecEnvWrapper
+```
+
+The `amp_style_reward_term(env, ...)` function is called inside the simulation step, where `env` = `ManagerBasedRLEnv`. But `env.unwrapped` at the `DictObsWrapper` level points to `RslRlVecEnvWrapper` — a *wrapper* that the reward term never sees.
+
+**Fix:** Save a reference to the base env immediately after `gym.make()`, before ANY wrapping:
+
+```python
+env = gym.make(task, cfg=env_cfg)
+base_env = env.unwrapped if hasattr(env, "unwrapped") else env
+
+# ... later wrappers (RslRlVecEnvWrapper, DictObsWrapper) ...
+
+# Attach EVERYTHING to base_env, NOT env.unwrapped:
+base_env.amp_discriminator = amp_disc
+base_env.amp_expert_buffer = expert_buf
+base_env.amp_recent_transitions = []
+base_env.amp_style_scale = 1.0
+# ... all other amp_* attributes ...
+```
+
+Inside the monkeypatched `wrapped_update` closure, also reference `base_env` (not `env.unwrapped`) for accessing buffers and flags.
+
+**Verification:** After the fix, training should print:
+```
+[AMP] Discriminator attached to base env (state_dim=59, enriched=True, multi_scale=True)
+```
+And `Rewards/amp_style` in TensorBoard should show non-zero values.
+
+### Debugging when style reward is still 0 after the fix
+
+If `amp_style` remains 0 even after attaching to `base_env`, add targeted debug prints to `amp_style_reward_term()` in `core.py` to diagnose which branch is taken:
+
+**Step 1 — Check discriminator presence and env identity:**
+```python
+# In the "compute style reward" section of amp_style_reward_term():
+_disc_ok = hasattr(env, "amp_discriminator") and env.amp_discriminator is not None
+_has_prev = hasattr(env, "amp_prev_state") and env.amp_prev_state is not None
+if not _disc_ok or not _has_prev:
+    if not _disc_ok:
+        print(f"[AMP DEBUG] disc missing: hasattr={hasattr(env, 'amp_discriminator')}, "
+              f"env_id={id(env)}, env_type={type(env).__name__}", flush=True)
+    return torch.zeros(env.num_envs, device=env.device)
+```
+
+**Step 2 — Print `base_env` identity at discriminator attachment time:**
+```python
+# In train.py, after attaching discriminator:
+print(f"[AMP] Discriminator attached to base env (..., env_id={id(base_env)})")
+```
+
+**Step 3 — Compare:** If the `env_id` from the reward term mismatches the `env_id` from attachment, the discriminator is on the wrong object. Either:
+- A wrapper was added after `base_env` was saved but before training, changing `.unwrapped`
+- The RewardManager receives a different reference than the one captured as `base_env`
+
+**Step 4 — Check scale and computed reward values:**
+```python
+scale = getattr(env, "amp_style_scale", 0.0)
+print(f"[AMP DEBUG] mean_score={...}, mean_reward={...}, scale={scale}", flush=True)
+```
+
+**Expected on first step:** `[AMP DEBUG] no prev_state (first step)` → reward is 0 (one-time).
+**Expected from second step:** `mean_reward ≈ 0.6` with untrained discriminator, rising toward 1.0 as training progresses.
+**If `mean_reward` is always 0 despite passing all checks:** verify `amp_style_scale` is non-zero and the discriminator forward pass doesn't silently error inside `torch.no_grad()`.
+
+## TensorBoard logging: use `runner.writer.add_scalar()`, not `runner.log_dict()`
+
+RSL-RL's `OnPolicyRunner` does NOT have a `log_dict` method. The correct API is:
+
+```python
+if hasattr(runner, "writer") and runner.writer is not None:
+    it = getattr(runner, "current_learning_iteration", 0)
+    runner.writer.add_scalar("amp/disc_loss", loss.item(), it)
+    runner.writer.add_scalar("amp/expert_acc", e_acc, it)
+    runner.writer.add_scalar("amp/policy_acc", p_acc, it)
+    runner.writer.add_scalar("amp/disc_mean", (e_acc + p_acc) / 2.0, it)
+```
+
+**Why the `if` guard matters:** `hasattr(runner, "log_dict")` silently returned `False` and all AMP logs were skipped. Always verify the actual RSL-RL API before hooking into it.
+
+## RSL-RL training shell script requires subcommand
+
+`./unitree_rl_lab.sh` uses a case statement; bare arguments fall through to the `*)` no-op:
+
+```bash
+# WRONG — silently does nothing:
+./unitree_rl_lab.sh --task Unitree-G1-29dof-Mimic-Dance-102 --num_envs 4096
+
+# CORRECT:
+./unitree_rl_lab.sh --train --task Unitree-G1-29dof-Mimic-Dance-102 --num_envs 4096
+./unitree_rl_lab.sh --play --task Unitree-G1-29dof-Mimic-Dance-102 --load_run 2026-06-08_22-11-39
+```
