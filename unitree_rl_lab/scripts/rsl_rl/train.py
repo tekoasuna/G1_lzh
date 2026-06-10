@@ -157,9 +157,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
+    # Keep a reference to the base sim environment BEFORE wrapping.
+    # AMP reward term runs inside the sim and sees this exact object, so the
+    # discriminator, buffers, and flags MUST be attached here, not on wrappers.
+    base_env = env.unwrapped if hasattr(env, "unwrapped") else env
+
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
+        base_env = env.unwrapped if hasattr(env, "unwrapped") else env
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
@@ -265,7 +271,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             foot_names = getattr(amp_cfg, "amp_foot_body_names", None)
             hand_names = getattr(amp_cfg, "amp_hand_body_names", None)
 
-            env.unwrapped.amp_expert_buffer = AmpExpertBuffer(
+            base_env.amp_expert_buffer = AmpExpertBuffer(
                 expert_file,
                 motion_fps=expert_fps,
                 device=agent_cfg.device,
@@ -275,11 +281,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
 
             # --- determine state dim ---
-            if use_enriched and hasattr(env.unwrapped.amp_expert_buffer, "state_dim"):
-                state_dim = env.unwrapped.amp_expert_buffer.state_dim
+            if use_enriched and hasattr(base_env.amp_expert_buffer, "state_dim"):
+                state_dim = base_env.amp_expert_buffer.state_dim
             else:
                 try:
-                    robot_asset = env.unwrapped.scene["robot"]
+                    robot_asset = base_env.scene["robot"]
                     num_joints = int(robot_asset.data.joint_pos.shape[1])
                 except Exception:
                     num_joints = 29
@@ -321,25 +327,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
 
             # --- attach to env ---
-            env.unwrapped.amp_discriminator = amp_disc
-            env.unwrapped.amp_discriminator_opt = amp_opt
-            env.unwrapped.amp_style_scale = (getattr(amp_cfg, "style_reward_scale", 0.0) *
+            base_env.amp_discriminator = amp_disc
+            base_env.amp_discriminator_opt = amp_opt
+            base_env.amp_style_scale = (getattr(amp_cfg, "style_reward_scale", 0.0) *
                                               getattr(amp_cfg, "reward_ratio", 1.0))
-            env.unwrapped.amp_recent_transitions = []
-            env.unwrapped.amp_style_reward_temperature = getattr(amp_cfg, "style_reward_temperature", 2.0)
-            env.unwrapped.amp_use_enriched_state = use_enriched
-            env.unwrapped.amp_use_multi_scale = use_multi_scale
-            env.unwrapped.amp_multi_scale_step = getattr(amp_cfg, "amp_multi_scale_step", 5)
+            base_env.amp_recent_transitions = []
+            base_env.amp_style_reward_temperature = getattr(amp_cfg, "style_reward_temperature", 2.0)
+            base_env.amp_use_enriched_state = use_enriched
+            base_env.amp_use_multi_scale = use_multi_scale
+            base_env.amp_multi_scale_step = getattr(amp_cfg, "amp_multi_scale_step", 5)
+            print(f"[AMP] Discriminator attached to base env (state_dim={state_dim}, "
+                  f"enriched={use_enriched}, multi_scale={use_multi_scale})")
 
             # --- body indexes for enriched state ---
             if use_enriched:
                 try:
-                    asset = env.unwrapped.scene["robot"]
+                    asset = base_env.scene["robot"]
                     body_names = list(asset.body_names) if hasattr(asset, "body_names") else []
                     if foot_names and body_names:
-                        env.unwrapped.amp_foot_body_ids = [body_names.index(n) for n in foot_names if n in body_names]
+                        base_env.amp_foot_body_ids = [body_names.index(n) for n in foot_names if n in body_names]
                     if hand_names and body_names:
-                        env.unwrapped.amp_hand_body_ids = [body_names.index(n) for n in hand_names if n in body_names]
+                        base_env.amp_hand_body_ids = [body_names.index(n) for n in hand_names if n in body_names]
                 except Exception:
                     pass
 
@@ -352,12 +360,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
                     try:
                         batch_size = int(getattr(amp_cfg, "discriminator_batch_size", 1024))
-                        expert_buf = env.unwrapped.amp_expert_buffer
+                        expert_buf = base_env.amp_expert_buffer
                         step_dt = 1.0 / expert_buf.motion_fps
-                        multi_scale = getattr(env.unwrapped, "amp_use_multi_scale", False)
+                        multi_scale = getattr(base_env, "amp_use_multi_scale", False)
 
                         # --- sample policy transitions ---
-                        policy_buf = getattr(env.unwrapped, "amp_recent_transitions", [])
+                        policy_buf = getattr(base_env, "amp_recent_transitions", [])
                         if len(policy_buf) == 0:
                             return result
                         buf_len = len(policy_buf)
@@ -380,7 +388,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                             )
 
                             # sample multi-scale policy transitions
-                            multi_buf = getattr(env.unwrapped, "amp_recent_multi_transitions", [])
+                            multi_buf = getattr(base_env, "amp_recent_multi_transitions", [])
                             policy_long = None
                             if len(multi_buf) > 0:
                                 midx = torch.randint(0, len(multi_buf), (batch_size,))
@@ -436,30 +444,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         torch.nn.utils.clip_grad_norm_(amp_disc.parameters(), max_grad)
                         amp_opt.step()
 
-                        # log discriminator accuracy periodically
-                        if hasattr(runner, "log_dict"):
-                            try:
-                                test_batch = min(256, batch_size)
-                                if multi_scale:
-                                    e_acc, p_acc = amp_discriminator_accuracy(
-                                        disc.discriminators[0],
-                                        expert_short[:test_batch],
-                                        policy_trans[:test_batch],
-                                    )
-                                else:
-                                    e_acc, p_acc = amp_discriminator_accuracy(
-                                        amp_disc,
-                                        expert_trans[:test_batch] if not multi_scale else expert_short[:test_batch],
-                                        policy_trans[:test_batch],
-                                    )
-                                runner.log_dict({
-                                    "amp_disc_loss": loss.item(),
-                                    "amp_expert_acc": e_acc,
-                                    "amp_policy_acc": p_acc,
-                                    "amp_disc_mean": (e_acc + p_acc) / 2.0,
-                                })
-                            except Exception:
-                                pass
+                        # log discriminator accuracy to TensorBoard
+                        try:
+                            test_batch = min(256, batch_size)
+                            if multi_scale:
+                                e_acc, p_acc = amp_discriminator_accuracy(
+                                    disc.discriminators[0],
+                                    expert_short[:test_batch],
+                                    policy_trans[:test_batch],
+                                )
+                            else:
+                                e_acc, p_acc = amp_discriminator_accuracy(
+                                    amp_disc,
+                                    expert_trans[:test_batch] if not multi_scale else expert_short[:test_batch],
+                                    policy_trans[:test_batch],
+                                )
+                            if hasattr(runner, "writer") and runner.writer is not None:
+                                it = getattr(runner, "current_learning_iteration", 0)
+                                runner.writer.add_scalar("amp/disc_loss", loss.item(), it)
+                                runner.writer.add_scalar("amp/expert_acc", e_acc, it)
+                                runner.writer.add_scalar("amp/policy_acc", p_acc, it)
+                                runner.writer.add_scalar("amp/disc_mean", (e_acc + p_acc) / 2.0, it)
+                        except Exception:
+                            pass
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
@@ -483,7 +490,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-    export_deploy_cfg(env.unwrapped, log_dir)
+    export_deploy_cfg(base_env, log_dir)
     # copy the environment configuration file to the log directory
     shutil.copy(
         inspect.getfile(env_cfg.__class__),
