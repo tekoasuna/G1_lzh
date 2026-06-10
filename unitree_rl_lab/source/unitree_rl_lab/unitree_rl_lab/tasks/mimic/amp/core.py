@@ -507,7 +507,14 @@ def amp_style_reward_term(env, asset_cfg=None):
                 pass
 
     # --- compute style reward ---
-    if not hasattr(env, "amp_discriminator") or env.amp_discriminator is None:
+    _disc_ok = hasattr(env, "amp_discriminator") and env.amp_discriminator is not None
+    _has_prev = hasattr(env, "amp_prev_state") and env.amp_prev_state is not None
+    if not _disc_ok or not _has_prev:
+        if not _disc_ok:
+            print(f"[AMP DEBUG] disc missing: hasattr={hasattr(env, 'amp_discriminator')}, "
+                  f"env_id={id(env)}, env_type={type(env).__name__}", flush=True)
+        if not _has_prev:
+            print(f"[AMP DEBUG] no prev_state (first step)", flush=True)
         env.amp_prev_state = current_state.detach().cpu()
         return torch.zeros(env.num_envs, device=env.device)
 
@@ -516,6 +523,7 @@ def amp_style_reward_term(env, asset_cfg=None):
     transition_dev = transition.to(device)
 
     with torch.no_grad():
+        score = None
         temperature = getattr(env, "amp_style_reward_temperature", 2.0)
 
         if isinstance(disc, MultiScaleAMPDiscriminator):
@@ -536,6 +544,16 @@ def amp_style_reward_term(env, asset_cfg=None):
 
     scale = getattr(env, "amp_style_scale", 0.0)
     style_reward = style_reward * float(scale)
+
+    _call_count = getattr(env, "_amp_debug_count", 0)
+    env._amp_debug_count = _call_count + 1
+    if _call_count < 3:
+        if score is not None:
+            print(f"[AMP DEBUG] step={_call_count}, mean_score={torch.mean(score).item():.4f}, "
+                  f"mean_reward={torch.mean(style_reward).item():.4f}, scale={scale:.4f}", flush=True)
+        else:
+            print(f"[AMP DEBUG] step={_call_count}, multi_scale mode, "
+                  f"mean_reward={torch.mean(style_reward).item():.4f}, scale={scale:.4f}", flush=True)
 
     env.amp_prev_state = current_state.detach().cpu()
     return style_reward.to(env.device).view(-1)
