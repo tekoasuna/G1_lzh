@@ -206,25 +206,40 @@ class AMPDiscriminator(nn.Module):
             spectral_norm=spectral_norm,
             dropout=dropout,
         )
-        children = list(self.network.children())
-        self.features_net = nn.Sequential(*children[:-1])
-        self.head = children[-1]
 
     def forward(self, transition: torch.Tensor | Sequence[torch.Tensor]) -> torch.Tensor:
         if isinstance(transition, (tuple, list)):
             transition = build_amp_transition(transition[0], transition[1])
-        feats = self.features_net(transition)
-        logits = self.head(feats)
+        logits = self.network(transition)
         return logits.squeeze(-1)
-
-    def features(self, transition: torch.Tensor | Sequence[torch.Tensor]) -> torch.Tensor:
-        if isinstance(transition, (tuple, list)):
-            transition = build_amp_transition(transition[0], transition[1])
-        return self.features_net(transition)
 
     def score(self, transition: torch.Tensor | Sequence[torch.Tensor], detach: bool = False) -> torch.Tensor:
         score = torch.sigmoid(self.forward(transition))
         return score.detach() if detach else score
+
+    def features(self, transition: torch.Tensor | Sequence[torch.Tensor]) -> torch.Tensor:
+        """Penultimate features (manual traversal); for expert stat tracking."""
+        if isinstance(transition, (tuple, list)):
+            transition = build_amp_transition(transition[0], transition[1])
+        modules = list(self.network.children())
+        x = transition
+        for m in modules[:-1]:
+            x = m(x)
+        return x
+
+    def score_with_features(
+        self, transition: torch.Tensor | Sequence[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single traversal returning (score, penultimate_features)."""
+        if isinstance(transition, (tuple, list)):
+            transition = build_amp_transition(transition[0], transition[1])
+        modules = list(self.network.children())
+        x = transition
+        for m in modules[:-1]:
+            x = m(x)
+        feats = x
+        logits = modules[-1](x).squeeze(-1)
+        return torch.sigmoid(logits), feats
 
 
 class MultiScaleAMPDiscriminator(nn.Module):
@@ -411,8 +426,7 @@ def multi_scale_amp_style_reward(
     t0 = build_amp_transition(current_state, next_state)
     with torch.no_grad():
         if return_features:
-            s0_features = discriminator.discriminators[0].features(t0)
-            s0_score = torch.sigmoid(discriminator.discriminators[0].head(s0_features))
+            s0_score, s0_features = discriminator.discriminators[0].score_with_features(t0)
         else:
             s0_score = discriminator.discriminators[0].score(t0, detach=False)
     r0 = torch.exp(-temperature * torch.square(s0_score - 1.0))
@@ -571,8 +585,11 @@ def amp_style_reward_term(env, asset_cfg=None):
             if fm_needed:
                 style_reward, policy_feats = style_reward
         else:
-            policy_feats = disc.features(transition_dev)
-            score = torch.sigmoid(disc.head(policy_feats))
+            fm_alpha = float(getattr(env, "amp_feature_matching_alpha", 0.0))
+            if fm_alpha > 0.0 and hasattr(env, "amp_expert_feat_mean") and env.amp_expert_feat_mean is not None:
+                score, policy_feats = disc.score_with_features(transition_dev)
+            else:
+                score = torch.sigmoid(disc(transition_dev))
             style_reward = torch.exp(-temperature * torch.square(score - 1.0))
 
     scale = getattr(env, "amp_style_scale", 0.0)
