@@ -389,7 +389,8 @@ def multi_scale_amp_style_reward(
     multi_next_state: torch.Tensor | None = None,
     temperature: float = 2.0,
     scale_weights: Sequence[float] | None = None,
-) -> torch.Tensor:
+    return_features: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Multi-scale style reward: averages rewards from all sub-discriminators.
 
     Args:
@@ -399,14 +400,22 @@ def multi_scale_amp_style_reward(
         multi_next_state: optional far-future state (k-step transition) for coarser scale.
         temperature: reward temperature.
         scale_weights: weights for each scale. Defaults to uniform.
+        return_features: if True, return (reward, scale0_features) tuple.
     """
     if scale_weights is None:
         scale_weights = [1.0 / discriminator.num_scales] * discriminator.num_scales
 
     rewards = []
+    s0_features = None
     # scale 0: 1-step transition
     t0 = build_amp_transition(current_state, next_state)
-    r0 = amp_style_reward(discriminator.discriminators[0], t0, temperature=temperature)
+    with torch.no_grad():
+        if return_features:
+            s0_features = discriminator.discriminators[0].features(t0)
+            s0_score = torch.sigmoid(discriminator.discriminators[0].head(s0_features))
+        else:
+            s0_score = discriminator.discriminators[0].score(t0, detach=False)
+    r0 = torch.exp(-temperature * torch.square(s0_score - 1.0))
     rewards.append(r0 * scale_weights[0])
 
     # scale 1: multi-step transition (if available)
@@ -415,7 +424,8 @@ def multi_scale_amp_style_reward(
         r1 = amp_style_reward(discriminator.discriminators[1], t1, temperature=temperature)
         rewards.append(r1 * scale_weights[1])
 
-    return sum(rewards)
+    total = sum(rewards)
+    return (total, s0_features) if return_features else total
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +549,7 @@ def amp_style_reward_term(env, asset_cfg=None):
 
     with torch.no_grad():
         score = None
+        policy_feats = None
         temperature = getattr(env, "amp_style_reward_temperature", 2.0)
 
         if isinstance(disc, MultiScaleAMPDiscriminator):
@@ -546,15 +557,22 @@ def amp_style_reward_term(env, asset_cfg=None):
             if multi_prev_state is not None:
                 mt = build_amp_transition(multi_prev_state, current_state)
                 multi_transition_dev = mt.to(device)
+            fm_needed = (float(getattr(env, "amp_feature_matching_alpha", 0.0)) > 0.0
+                         and hasattr(env, "amp_expert_feat_mean")
+                         and env.amp_expert_feat_mean is not None)
             style_reward = multi_scale_amp_style_reward(
                 disc,
                 prev_state.to(device),
                 current_state.to(device),
                 multi_next_state=None if multi_transition_dev is None else current_state.to(device),
                 temperature=temperature,
+                return_features=fm_needed,
             )
+            if fm_needed:
+                style_reward, policy_feats = style_reward
         else:
-            score = torch.sigmoid(disc(transition_dev))
+            policy_feats = disc.features(transition_dev)
+            score = torch.sigmoid(disc.head(policy_feats))
             style_reward = torch.exp(-temperature * torch.square(score - 1.0))
 
     scale = getattr(env, "amp_style_scale", 0.0)
@@ -562,16 +580,11 @@ def amp_style_reward_term(env, asset_cfg=None):
 
     # --- feature matching reward ---
     fm_alpha = float(getattr(env, "amp_feature_matching_alpha", 0.0))
-    if fm_alpha > 0.0 and hasattr(env, "amp_expert_feat_mean") and env.amp_expert_feat_mean is not None:
-        with torch.no_grad():
-            if isinstance(disc, MultiScaleAMPDiscriminator):
-                policy_feats = disc.discriminators[0].features(transition_dev)
-            else:
-                policy_feats = disc.features(transition_dev)
-            feat_mean = env.amp_expert_feat_mean.to(device)
-            feat_std = torch.sqrt(env.amp_expert_feat_var.to(device))
-            dist = torch.norm((policy_feats - feat_mean) / feat_std, dim=-1)
-            fm_reward = torch.exp(-fm_alpha * dist)
+    if fm_alpha > 0.0 and policy_feats is not None:
+        feat_mean = env.amp_expert_feat_mean.to(device)
+        feat_std = torch.sqrt(env.amp_expert_feat_var.to(device))
+        dist = torch.norm((policy_feats - feat_mean) / feat_std, dim=-1)
+        fm_reward = torch.exp(-fm_alpha * dist)
         style_reward = (style_reward + fm_reward) / 2.0
 
     _call_count = getattr(env, "_amp_debug_count", 0)
