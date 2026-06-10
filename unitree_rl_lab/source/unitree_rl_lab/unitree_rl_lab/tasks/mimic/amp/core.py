@@ -206,12 +206,21 @@ class AMPDiscriminator(nn.Module):
             spectral_norm=spectral_norm,
             dropout=dropout,
         )
+        children = list(self.network.children())
+        self.features_net = nn.Sequential(*children[:-1])
+        self.head = children[-1]
 
     def forward(self, transition: torch.Tensor | Sequence[torch.Tensor]) -> torch.Tensor:
         if isinstance(transition, (tuple, list)):
             transition = build_amp_transition(transition[0], transition[1])
-        logits = self.network(transition)
+        feats = self.features_net(transition)
+        logits = self.head(feats)
         return logits.squeeze(-1)
+
+    def features(self, transition: torch.Tensor | Sequence[torch.Tensor]) -> torch.Tensor:
+        if isinstance(transition, (tuple, list)):
+            transition = build_amp_transition(transition[0], transition[1])
+        return self.features_net(transition)
 
     def score(self, transition: torch.Tensor | Sequence[torch.Tensor], detach: bool = False) -> torch.Tensor:
         score = torch.sigmoid(self.forward(transition))
@@ -246,6 +255,12 @@ class MultiScaleAMPDiscriminator(nn.Module):
 
     def forward(self, transition: torch.Tensor | Sequence[torch.Tensor], scale: int = 0) -> torch.Tensor:
         return self.discriminators[scale](transition)
+
+    def features(self, transition: torch.Tensor | Sequence[torch.Tensor], scale: int | None = None) -> torch.Tensor | list[torch.Tensor]:
+        """Return penultimate features from one or all sub-discriminators."""
+        if scale is not None:
+            return self.discriminators[scale].features(transition)
+        return [d.features(transition) for d in self.discriminators]
 
     def forward_all(self, transitions: Sequence[torch.Tensor]) -> list[torch.Tensor]:
         """Forward pass through all discriminators.
@@ -544,6 +559,20 @@ def amp_style_reward_term(env, asset_cfg=None):
 
     scale = getattr(env, "amp_style_scale", 0.0)
     style_reward = style_reward * float(scale)
+
+    # --- feature matching reward ---
+    fm_alpha = float(getattr(env, "amp_feature_matching_alpha", 0.0))
+    if fm_alpha > 0.0 and hasattr(env, "amp_expert_feat_mean") and env.amp_expert_feat_mean is not None:
+        with torch.no_grad():
+            if isinstance(disc, MultiScaleAMPDiscriminator):
+                policy_feats = disc.discriminators[0].features(transition_dev)
+            else:
+                policy_feats = disc.features(transition_dev)
+            feat_mean = env.amp_expert_feat_mean.to(device)
+            feat_std = torch.sqrt(env.amp_expert_feat_var.to(device))
+            dist = torch.norm((policy_feats - feat_mean) / feat_std, dim=-1)
+            fm_reward = torch.exp(-fm_alpha * dist)
+        style_reward = (style_reward + fm_reward) / 2.0
 
     _call_count = getattr(env, "_amp_debug_count", 0)
     env._amp_debug_count = _call_count + 1

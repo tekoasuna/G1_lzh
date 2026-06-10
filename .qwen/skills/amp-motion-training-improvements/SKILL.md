@@ -130,7 +130,40 @@ Inside the monkeypatched `wrapped_update` closure, also reference `base_env` (no
 ```
 And `Rewards/amp_style` in TensorBoard should show non-zero values.
 
-### Debugging when style reward is still 0 after the fix
+## Critical gotcha #2: discriminator `state_dim` must match runtime AMP state, not expert buffer
+
+**The bug:** Discriminator built with wrong input dimension, causing a `mat1 and mat2 shapes cannot be multiplied` crash on the first style reward computation. Even if no crash (state_dim too small but catches by accident), the style reward may silently produce garbage.
+
+**Root cause:** The expert buffer precomputes enriched states from offline `.npz` data where `root_lin_vel` and `root_ang_vel` are `None` (velocity can't be recovered from position-only data). This produces a smaller state vector than the runtime `amp_style_reward_term`, which has access to full simulation sensor data.
+
+**Example:** With G1 (29 DOF, 2 feet, 2 hands):
+- Expert buffer enriched state: `1 + 58 + 3 + 0 + 0 + 6 + 6 = 74` (or 62 without foot/hand)  
+- Runtime enriched state: `1 + 58 + 3 + 3 + 3 + 6 + 6 = 80`
+
+The discriminator's first layer is `Linear(state_dim * 2, 512)`. If built with `state_dim=62`, it expects 124-dim input; actual transitions are 160-dim → crash.
+
+**Fix:** Never use `base_env.amp_expert_buffer.state_dim` for the discriminator. Compute `state_dim` from the same components the runtime `build_amp_state` will use:
+
+```python
+# In train.py, after loading the expert buffer:
+try:
+    robot_asset = base_env.scene["robot"]
+    num_joints = int(robot_asset.data.joint_pos.shape[1])
+except Exception:
+    num_joints = 29
+if use_enriched:
+    state_dim = 1 + num_joints * 2 + 3 + 3 + 3  # base + joints + proj_gravity + lin_vel + ang_vel
+    if foot_names:
+        state_dim += 3 * len(foot_names)
+    if hand_names:
+        state_dim += 3 * len(hand_names)
+else:
+    state_dim = 1 + num_joints * 2
+```
+
+**Verification:** The startup print should show `state_dim=80` (with feet+hands) or `state_dim=68` (without). If it shows 62, 59, or any number not matching `1 + N*2 + (3 if enriched) + ... + (3*K feet) + (3*M hands)`, something is wrong.
+
+### Debugging when style reward is still 0 after both fixes
 
 If `amp_style` remains 0 even after attaching to `base_env`, add targeted debug prints to `amp_style_reward_term()` in `core.py` to diagnose which branch is taken:
 

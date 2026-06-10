@@ -343,6 +343,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             base_env.amp_use_enriched_state = use_enriched
             base_env.amp_use_multi_scale = use_multi_scale
             base_env.amp_multi_scale_step = getattr(amp_cfg, "amp_multi_scale_step", 5)
+            base_env.amp_feature_matching_alpha = float(getattr(amp_cfg, "feature_matching_alpha", 0.0))
+            # feature matching running stats
+            base_env.amp_expert_feat_mean = None
+            base_env.amp_expert_feat_var = None
             print(f"[AMP] Discriminator attached to base env (state_dim={state_dim}, "
                   f"enriched={use_enriched}, multi_scale={use_multi_scale})")
 
@@ -450,6 +454,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         max_grad = float(getattr(amp_cfg, "max_grad_norm", 1.0))
                         torch.nn.utils.clip_grad_norm_(amp_disc.parameters(), max_grad)
                         amp_opt.step()
+
+                        # --- update expert feature running stats for feature matching ---
+                        fm_alpha = float(getattr(amp_cfg, "feature_matching_alpha", 0.0))
+                        if fm_alpha > 0.0:
+                            test_batch = min(256, batch_size)
+                            with torch.no_grad():
+                                if multi_scale:
+                                    expert_feats = disc.discriminators[0].features(expert_short[:test_batch].to(agent_cfg.device))
+                                else:
+                                    expert_feats = amp_disc.features(expert_trans[:test_batch].to(agent_cfg.device))
+                                expert_feats = expert_feats.detach()
+                            # EMA update of mean and variance
+                            if base_env.amp_expert_feat_mean is None:
+                                base_env.amp_expert_feat_mean = expert_feats.mean(dim=0)
+                                base_env.amp_expert_feat_var = expert_feats.var(dim=0, unbiased=False) + 1e-6
+                            else:
+                                momentum = 0.99
+                                base_env.amp_expert_feat_mean = (
+                                    momentum * base_env.amp_expert_feat_mean +
+                                    (1.0 - momentum) * expert_feats.mean(dim=0)
+                                )
+                                base_env.amp_expert_feat_var = (
+                                    momentum * base_env.amp_expert_feat_var +
+                                    (1.0 - momentum) * (expert_feats.var(dim=0, unbiased=False) + 1e-6)
+                                )
 
                         # log discriminator accuracy to TensorBoard
                         try:

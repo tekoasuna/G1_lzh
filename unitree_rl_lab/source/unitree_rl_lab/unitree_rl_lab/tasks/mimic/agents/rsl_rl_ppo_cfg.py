@@ -44,6 +44,9 @@ class AmpPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     style_reward_scale = 1.0
     reward_ratio = 1.0
 
+    # --- Feature matching ---
+    feature_matching_alpha = 0.5   # 0 = disabled, >0 = L2 feature matching weight
+
     # --- Policy ---
     policy_loss_detach_discriminator = True
 
