@@ -281,14 +281,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
 
             # --- determine state dim ---
-            if use_enriched and hasattr(base_env.amp_expert_buffer, "state_dim"):
-                state_dim = base_env.amp_expert_buffer.state_dim
+            # NOTE: The expert buffer may report a different state_dim because
+            # offline data lacks root_lin_vel/root_ang_vel. Compute from the
+            # runtime environment so discriminator input matches actual AMP state.
+            try:
+                robot_asset = base_env.scene["robot"]
+                num_joints = int(robot_asset.data.joint_pos.shape[1])
+            except Exception:
+                num_joints = 29
+            if use_enriched:
+                state_dim = 1 + num_joints * 2 + 3 + 3 + 3  # base + joints + proj_gravity + lin_vel + ang_vel
+                if foot_names:
+                    state_dim += 3 * len(foot_names)
+                if hand_names:
+                    state_dim += 3 * len(hand_names)
             else:
-                try:
-                    robot_asset = base_env.scene["robot"]
-                    num_joints = int(robot_asset.data.joint_pos.shape[1])
-                except Exception:
-                    num_joints = 29
                 state_dim = 1 + num_joints * 2
 
             # --- build discriminator ---
